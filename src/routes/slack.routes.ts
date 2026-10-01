@@ -6,10 +6,11 @@ import { parseSlackInteraction } from "../slack/slack.events.js";
 import type { SlackStreamingService } from "../slack/slack.streaming.js";
 import { SlackFormatter } from "../slack/slack.service.js";
 import type { InvestigationRepository } from "../storage/repositories/investigation.repository.js";
+import type { InvestigationService } from "../investigation/investigation.service.js";
 
 type RawRequest = { rawBody?: Buffer };
 
-export function slackRoutes(config: AppConfig, repository: InvestigationRepository, queue: InvestigationQueue, streaming: SlackStreamingService, formatter: SlackFormatter): Router {
+export function slackRoutes(config: AppConfig, repository: InvestigationRepository, queue: InvestigationQueue, streaming: SlackStreamingService, formatter: SlackFormatter, service: InvestigationService): Router {
   const router = Router();
   router.post("/webhooks/slack", async (request, response, next) => {
     try {
@@ -32,6 +33,25 @@ export function slackRoutes(config: AppConfig, repository: InvestigationReposito
       const interaction = parseSlackInteraction(payload);
       if (!interaction) return response.status(200).json({ ignored: true });
       if (!config.SLACK_APPROVER_USER_IDS.includes(interaction.userId)) return response.status(403).json({ error: "Not authorized to approve investigations" });
+      if (interaction.kind === "control") {
+        const investigation = await repository.getInvestigation(interaction.investigationId);
+        if (!investigation) return response.status(404).json({ error: "Investigation not found" });
+        const issueKey = investigation.jiraIssue.issueKey;
+        if (interaction.action === "stop") {
+          const stopped = service.stop(interaction.investigationId);
+          if (stopped) await streaming.updateMessage(interaction.channelId, interaction.messageTs, formatter.stopping(issueKey));
+          return response.status(200).json({ ok: true, stopped });
+        }
+        if (interaction.action === "continue") {
+          const queued = await repository.continueInvestigation(interaction.investigationId, interaction.interactionId, { userId: interaction.userId, teamId: interaction.teamId });
+          if (queued) { await streaming.updateMessage(interaction.channelId, interaction.messageTs, formatter.resuming(issueKey)); queue.kick(); }
+          return response.status(200).json({ ok: true, queued });
+        }
+        const dismissed = await repository.dismissInvestigation(interaction.investigationId, interaction.interactionId);
+        service.dismiss(interaction.investigationId);
+        if (dismissed) await streaming.updateMessage(interaction.channelId, interaction.messageTs, formatter.dismissed(issueKey));
+        return response.status(200).json({ ok: true, dismissed });
+      }
       const decided = await repository.decideApproval(interaction.approvalId, interaction.userId, interaction.decision === "approve");
       if (!decided) return response.status(404).json({ error: "Approval not found" });
       if (decided.changed) {

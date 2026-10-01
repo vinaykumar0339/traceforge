@@ -97,6 +97,8 @@ SLACK_APPROVAL_TIMEOUT_MINUTES=60
 
 Before a Slack follow-up can change code, Traceforge asks Codex through a constrained, read-only intent gate to classify the request semantically as read-only, patch, commit, push, or uncertain. It does not use keyword matching. Patch, commit, and push requests receive a durable approval card that states the exact scope; uncertain requests fail closed as read-only. Only configured approvers can use these signed actions. A change-and-push approval additionally allows a normal (never force) push of that ticket branch to `origin`; it never alters the configured source checkout or another branch.
 
+Every active Codex run also has a signed Slack control card for configured approvers. **Stop** interrupts the active App Server turn and leaves the investigation paused. **Continue** queues the same investigation against its stored Codex thread; a previously approved write/push request is classified again and requires fresh approval. **Dismiss** cancels pending work but retains the isolated worktree and any already-created local changes.
+
 Example conversation:
 
 ```text

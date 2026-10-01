@@ -16,6 +16,7 @@ import { type WriteScope, WriteIntentClassifier } from "./write-intent.js";
 
 export class InvestigationService {
   private readonly contextBuilder: InvestigationContextBuilder;
+  private readonly activeRuns = new Map<string, { controller: AbortController; disposition: "paused" | "cancelled" }>();
   constructor(
     private readonly repository: InvestigationRepository,
     private readonly jira: JiraClient,
@@ -30,8 +31,26 @@ export class InvestigationService {
     private readonly logger: Logger,
   ) { this.contextBuilder = new InvestigationContextBuilder(repository); }
 
+  stop(investigationId: string): boolean {
+    const run = this.activeRuns.get(investigationId);
+    if (!run) return false;
+    run.disposition = "paused";
+    run.controller.abort();
+    return true;
+  }
+
+  dismiss(investigationId: string): boolean {
+    const run = this.activeRuns.get(investigationId);
+    if (!run) return false;
+    run.disposition = "cancelled";
+    run.controller.abort();
+    return true;
+  }
+
   async process(job: InvestigationJob): Promise<void> {
     let responseTs: string | undefined;
+    let controlTs: string | undefined;
+    let activeRun: { controller: AbortController; disposition: "paused" | "cancelled" } | undefined;
     try {
       let investigation = await this.repository.getInvestigation(job.investigationId);
       if (!investigation) throw new Error(`Investigation not found: ${job.investigationId}`);
@@ -77,13 +96,19 @@ export class InvestigationService {
       const allowPublish = writeApproved && (job.payload as { allowPublish?: unknown }).allowPublish === true;
       const prompt = buildCodexPrompt(context, writeApproved, allowCommit, allowPublish);
       await this.repository.addEvent(activeInvestigation.id, InvestigationEventType.AGENT_STARTED, "codex", question ?? "Initial investigation");
+      const controls = await this.streaming.postThreadMessage(thread.channelId, thread.threadTs, this.formatter.runControls({ investigationId: activeInvestigation.id, issueKey: fetched.key, summary: fetched.summary }));
+      controlTs = controls.ts;
       responseTs = await this.streaming.startResponse(thread.channelId, thread.threadTs, this.formatter.progress(question), requester);
+      activeRun = { controller: new AbortController(), disposition: "paused" };
+      this.activeRuns.set(activeInvestigation.id, activeRun);
       const result = await this.codex.run({
         workspacePath: prepared.rootPath,
         prompt,
         timeoutMs: this.timeoutMs,
         mode: writeApproved ? "workspace-write" : "read-only",
         allowNetwork: allowPublish,
+        additionalWritableRoots: allowCommit ? prepared.snapshots.flatMap((snapshot) => snapshot.gitWritePaths) : undefined,
+        signal: activeRun.controller.signal,
         threadId: activeInvestigation.codexThreadId ?? undefined,
         onThreadStarted: async (threadId) => { await this.repository.setCodexThreadId(activeInvestigation.id, threadId); },
         onEvent: (event) => {
@@ -100,14 +125,29 @@ export class InvestigationService {
       await this.repository.addEvent(activeInvestigation.id, InvestigationEventType.FINDING_ADDED, "codex", findings);
       await this.repository.setStatus(activeInvestigation.id, InvestigationStatus.COMPLETED, { summary: findings.slice(0, 1_000), findings, question: null });
       await this.streaming.finishResponse(responseTs, this.formatter.complete(fetched, findings, prepared.snapshots));
+      await this.streaming.updateMessage(thread.channelId, controlTs, this.formatter.finishedControls(fetched.key));
       await this.repository.completeJob(job.id);
     } catch (error) {
+      if (activeRun?.controller.signal.aborted) {
+        const cancelled = activeRun.disposition === "cancelled";
+        const status = cancelled ? InvestigationStatus.CANCELLED : InvestigationStatus.PAUSED;
+        const investigation = await this.repository.getInvestigation(job.investigationId).catch(() => null);
+        const issue = investigation ? normalizeJiraIssue(investigation.jiraIssue.snapshot) : null;
+        await this.repository.setStatus(job.investigationId, status).catch(() => undefined);
+        await this.repository.addEvent(job.investigationId, InvestigationEventType.AGENT_COMPLETED, "orchestrator", cancelled ? "Investigation dismissed from Slack" : "Investigation paused from Slack").catch(() => undefined);
+        await this.repository.completeJob(job.id).catch(() => undefined);
+        if (responseTs) await this.streaming.finishResponse(responseTs, cancelled ? this.formatter.dismissed(issue?.key ?? "Investigation") : this.formatter.pausedControls({ investigationId: job.investigationId, issueKey: issue?.key ?? "Investigation" })).catch(() => undefined);
+        if (controlTs && investigation) await this.streaming.updateMessage(investigation.slackThread?.channelId ?? this.slackChannelId, controlTs, cancelled ? this.formatter.dismissed(issue?.key ?? "Investigation") : this.formatter.pausedControls({ investigationId: job.investigationId, issueKey: issue?.key ?? "Investigation" })).catch(() => undefined);
+        return;
+      }
       const message = error instanceof Error ? error.message : String(error);
       this.logger.error({ err: error, jobId: job.id }, "Investigation job failed");
       await this.repository.addEvent(job.investigationId, InvestigationEventType.AGENT_ERROR, "orchestrator", message).catch(() => undefined);
       await this.repository.setStatus(job.investigationId, InvestigationStatus.FAILED).catch(() => undefined);
       await this.repository.failJob(job.id, message).catch(() => undefined);
       if (responseTs) await this.streaming.sendError(responseTs, this.formatter.error(message)).catch(() => undefined);
+    } finally {
+      if (activeRun && this.activeRuns.get(job.investigationId) === activeRun) this.activeRuns.delete(job.investigationId);
     }
   }
 

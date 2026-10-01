@@ -32,6 +32,10 @@ describe("Slack Events API handling", () => {
   });
 
   it("parses an approval button action without trusting its text", () => {
-    expect(parseSlackInteraction({ type: "block_actions", user: { id: "U1" }, container: { channel_id: "G1", message_ts: "2.0" }, actions: [{ action_id: "approval_approve", value: "approval-id", action_ts: "3.0" }] })).toEqual({ approvalId: "approval-id", decision: "approve", userId: "U1", channelId: "G1", messageTs: "2.0", interactionId: "U1:3.0:approval-id" });
+    expect(parseSlackInteraction({ type: "block_actions", user: { id: "U1" }, team: { id: "T1" }, container: { channel_id: "G1", message_ts: "2.0" }, actions: [{ action_id: "approval_approve", value: "approval-id", action_ts: "3.0" }] })).toEqual({ kind: "approval", approvalId: "approval-id", decision: "approve", userId: "U1", teamId: "T1", channelId: "G1", messageTs: "2.0", interactionId: "U1:3.0:approval-id" });
+  });
+
+  it("parses stop controls as investigation actions", () => {
+    expect(parseSlackInteraction({ type: "block_actions", user: { id: "U1" }, team: { id: "T1" }, container: { channel_id: "G1", message_ts: "2.0" }, actions: [{ action_id: "investigation_stop", value: "investigation-id", action_ts: "3.0" }] })).toMatchObject({ kind: "control", action: "stop", investigationId: "investigation-id", userId: "U1" });
   });
 });

@@ -29,7 +29,7 @@ async function main(): Promise<void> {
   const service = new InvestigationService(repository, new JiraClient(config), workspace, codex, streaming, formatter, config.CODEX_TIMEOUT_MS, config.SLACK_CHANNEL_ID, config.SLACK_APPROVAL_TIMEOUT_MINUTES, writeIntent, logger);
   const queue = new InvestigationQueue(repository, service, logger);
   await queue.start();
-  const app = createApp({ config, db, repository, queue, logger, streaming, formatter });
+  const app = createApp({ config, db, repository, queue, logger, streaming, formatter, service });
   const server = app.listen(config.PORT, () => logger.info({ port: config.PORT }, "Traceforge listening"));
   const shutdown = async (): Promise<void> => { queue.stop(); server.close(); await db.$disconnect(); };
   process.once("SIGINT", () => void shutdown());

@@ -68,6 +68,38 @@ export class InvestigationRepository {
     });
   }
 
+  async continueInvestigation(investigationId: string, interactionId: string, requester: { userId: string; teamId: string }): Promise<boolean> {
+    try {
+      await this.db.$transaction(async (tx) => {
+        const investigation = await tx.investigation.findUnique({ where: { id: investigationId } });
+        if (!investigation || investigation.status === InvestigationStatus.CANCELLED) throw new Error("Investigation cannot be continued");
+        const question = investigation.currentQuestion ?? "Continue the paused investigation from the saved context.";
+        await tx.investigation.update({ where: { id: investigationId }, data: { status: InvestigationStatus.CREATED } });
+        await tx.investigationEvent.create({ data: { investigationId, type: InvestigationEventType.USER_QUESTION, source: "slack", content: "Continue requested", metadata: json({ interactionId }) } });
+        await tx.investigationJob.create({ data: { investigationId, type: "SLACK_CONTINUE", payload: json({ question, requester }), dedupeKey: `continue:${interactionId}` } });
+      });
+      return true;
+    } catch (error) {
+      if (isUniqueError(error)) return false;
+      throw error;
+    }
+  }
+
+  async dismissInvestigation(investigationId: string, interactionId: string): Promise<boolean> {
+    try {
+      await this.db.$transaction(async (tx) => {
+        await tx.externalEvent.create({ data: { source: "slack-control", providerEventId: interactionId } });
+        await tx.investigation.update({ where: { id: investigationId }, data: { status: InvestigationStatus.CANCELLED } });
+        await tx.investigationJob.updateMany({ where: { investigationId, status: JobStatus.PENDING }, data: { status: JobStatus.CANCELLED, completedAt: new Date(), error: "Dismissed from Slack" } });
+        await tx.investigationEvent.create({ data: { investigationId, type: InvestigationEventType.AGENT_COMPLETED, source: "slack", content: "Investigation dismissed" } });
+      });
+      return true;
+    } catch (error) {
+      if (isUniqueError(error)) return false;
+      throw error;
+    }
+  }
+
   async updateJiraIssue(investigationId: string, issue: NormalizedJiraIssue): Promise<void> {
     const investigation = await this.db.investigation.findUniqueOrThrow({ where: { id: investigationId } });
     await this.db.jiraIssue.update({ where: { id: investigation.jiraIssueRecordId }, data: { snapshot: json(issue), fetchedAt: new Date() } });

@@ -8,6 +8,8 @@ export interface CodexRunOptions {
   mode?: "read-only" | "workspace-write";
   allowNetwork?: boolean;
   outputSchema?: Record<string, unknown>;
+  signal?: AbortSignal;
+  additionalWritableRoots?: string[];
   threadId?: string;
   onThreadStarted?: (threadId: string) => void | Promise<void>;
   onEvent?: (event: CodexStreamEvent) => void;
@@ -38,7 +40,7 @@ export class CodexRunner {
       const child = spawn(this.command, ["app-server"], { cwd: options.workspacePath, shell: false, stdio: ["pipe", "pipe", "pipe"] });
       const sandbox = options.mode === "workspace-write" ? "workspace-write" : "read-only";
       const sandboxPolicy = options.mode === "workspace-write"
-        ? { type: "workspaceWrite", writableRoots: [options.workspacePath], networkAccess: options.allowNetwork ?? false }
+        ? { type: "workspaceWrite", writableRoots: [options.workspacePath, ...(options.additionalWritableRoots ?? [])], networkAccess: options.allowNetwork ?? false }
         : { type: "readOnly", networkAccess: false };
       const pending = new Map<number, { resolve: (value: Record<string, unknown>) => void; reject: (error: Error) => void }>();
       const agentMessageIds = new Set<string>();
@@ -49,15 +51,24 @@ export class CodexRunner {
       let requestId = 0;
       let threadId = options.threadId;
       let turnId: string | undefined;
+      let interruptTimer: NodeJS.Timeout | undefined;
 
-      const settle = (result: CodexRunResult): void => { if (!settled) { settled = true; clearTimeout(timer); resolve(result); } };
-      const fail = (error: Error): void => { if (!settled) { settled = true; clearTimeout(timer); reject(error); } };
+      const settle = (result: CodexRunResult): void => { if (!settled) { settled = true; clearTimeout(timer); if (interruptTimer) clearTimeout(interruptTimer); options.signal?.removeEventListener("abort", interrupt); resolve(result); } };
+      const fail = (error: Error): void => { if (!settled) { settled = true; clearTimeout(timer); if (interruptTimer) clearTimeout(interruptTimer); options.signal?.removeEventListener("abort", interrupt); reject(error); } };
       const send = (message: unknown): void => { child.stdin.write(`${JSON.stringify(message)}\n`); };
       const request = (method: string, params: Record<string, unknown>): Promise<Record<string, unknown>> => {
         const id = ++requestId;
         return new Promise((resolveRequest, rejectRequest) => { pending.set(id, { resolve: resolveRequest, reject: rejectRequest }); send({ method, id, params }); });
       };
       const timer = setTimeout(() => { timedOut = true; child.kill("SIGTERM"); }, options.timeoutMs);
+      const interrupt = (): void => {
+        if (settled) return;
+        if (!threadId || !turnId) { child.kill("SIGTERM"); return; }
+        void request("turn/interrupt", { threadId, turnId }).catch(() => child.kill("SIGTERM"));
+        interruptTimer = setTimeout(() => child.kill("SIGTERM"), 5_000);
+      };
+      if (options.signal?.aborted) interrupt();
+      else options.signal?.addEventListener("abort", interrupt, { once: true });
 
       const onNotification = (message: RpcMessage): void => {
         const params = message.params ?? {};
