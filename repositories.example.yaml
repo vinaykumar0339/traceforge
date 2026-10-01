@@ -1,0 +1,10 @@
+# Copy to repositories.yaml and point each entry at an existing local Git checkout.
+repositories:
+  - name: backend
+    platform: backend
+    path: /absolute/path/to/backend
+    branch: main
+  - name: mobile
+    platform: react-native
+    path: /absolute/path/to/mobile
+    branch: main

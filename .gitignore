@@ -1,0 +1,8 @@
+node_modules/
+.pnpm-store/
+dist/
+.env
+repositories.yaml
+workspaces/
+coverage/
+*.log

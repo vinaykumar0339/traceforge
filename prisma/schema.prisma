@@ -1,0 +1,162 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum InvestigationStatus {
+  CREATED
+  PREPARING_WORKSPACE
+  INVESTIGATING
+  WAITING_FOR_INPUT
+  COMPLETED
+  FAILED
+}
+
+enum InvestigationEventType {
+  JIRA_CREATED
+  JIRA_UPDATED
+  USER_QUESTION
+  AGENT_STARTED
+  AGENT_OUTPUT
+  AGENT_COMPLETED
+  AGENT_ERROR
+  SLACK_MESSAGE
+  FINDING_ADDED
+}
+
+enum JobStatus {
+  PENDING
+  RUNNING
+  COMPLETED
+  FAILED
+}
+
+enum ApprovalAction {
+  CREATE_PATCH
+}
+
+enum ApprovalStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  EXPIRED
+}
+
+model JiraIssue {
+  id           String          @id @default(cuid())
+  jiraIssueId  String          @unique
+  issueKey     String          @unique
+  snapshot     Json
+  fetchedAt    DateTime        @default(now())
+  createdAt    DateTime        @default(now())
+  updatedAt    DateTime        @updatedAt
+  investigation Investigation?
+}
+
+model Investigation {
+  id               String              @id @default(cuid())
+  jiraIssueRecordId String              @unique
+  jiraIssue         JiraIssue           @relation(fields: [jiraIssueRecordId], references: [id], onDelete: Restrict)
+  status           InvestigationStatus @default(CREATED)
+  currentQuestion  String?
+  workspacePath    String?
+  latestSummary    String?
+  latestFindings   Json?
+  metadata         Json?
+  createdAt        DateTime            @default(now())
+  updatedAt        DateTime            @updatedAt
+  events           InvestigationEvent[]
+  slackThread      SlackThread?
+  repositorySnapshots RepositorySnapshot[]
+  jobs             InvestigationJob[]
+  approvals        ApprovalRequest[]
+}
+
+model InvestigationEvent {
+  id              String                 @id @default(cuid())
+  investigationId String
+  investigation   Investigation          @relation(fields: [investigationId], references: [id], onDelete: Cascade)
+  type            InvestigationEventType
+  source          String
+  content         String
+  metadata        Json?
+  createdAt       DateTime               @default(now())
+  @@index([investigationId, createdAt])
+}
+
+model SlackThread {
+  id              String        @id @default(cuid())
+  channelId       String
+  threadTs        String
+  investigationId String        @unique
+  investigation   Investigation @relation(fields: [investigationId], references: [id], onDelete: Cascade)
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+  @@unique([channelId, threadTs])
+}
+
+model RepositorySnapshot {
+  id              String        @id @default(cuid())
+  investigationId String
+  investigation   Investigation @relation(fields: [investigationId], references: [id], onDelete: Cascade)
+  repositoryName  String
+  platform        String?
+  sourcePath      String
+  workspacePath   String
+  branch          String
+  commitSha       String
+  lastUpdatedAt   DateTime      @default(now())
+  @@unique([investigationId, repositoryName])
+}
+
+model ExternalEvent {
+  id              String   @id @default(cuid())
+  source          String
+  providerEventId String
+  receivedAt      DateTime @default(now())
+  @@unique([source, providerEventId])
+}
+
+model InvestigationJob {
+  id              String    @id @default(cuid())
+  investigationId String
+  investigation   Investigation @relation(fields: [investigationId], references: [id], onDelete: Cascade)
+  type            String
+  payload         Json
+  dedupeKey       String    @unique
+  status          JobStatus @default(PENDING)
+  attempts        Int       @default(0)
+  error           String?
+  startedAt       DateTime?
+  completedAt     DateTime?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+  approvalRequest ApprovalRequest?
+  @@index([status, createdAt])
+  @@index([investigationId, status, createdAt])
+}
+
+model ApprovalRequest {
+  id                String         @id @default(cuid())
+  investigationId   String
+  investigation     Investigation  @relation(fields: [investigationId], references: [id], onDelete: Cascade)
+  jobId             String         @unique
+  job               InvestigationJob @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  action            ApprovalAction
+  status            ApprovalStatus @default(PENDING)
+  question          String
+  requestedByUserId String?
+  approvedByUserId  String?
+  decisionAt        DateTime?
+  expiresAt         DateTime
+  slackChannelId    String
+  slackThreadTs     String
+  slackMessageTs    String?
+  createdAt         DateTime       @default(now())
+  updatedAt         DateTime       @updatedAt
+  @@index([investigationId, status])
+}
