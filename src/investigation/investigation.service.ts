@@ -73,8 +73,21 @@ export class InvestigationService {
       const prompt = buildCodexPrompt(context, writeApproved);
       await this.repository.addEvent(activeInvestigation.id, InvestigationEventType.AGENT_STARTED, "codex", question ?? "Initial investigation");
       responseTs = await this.streaming.startResponse(thread.channelId, thread.threadTs, this.formatter.progress(question), requester);
-      const result = await this.codex.run({ workspacePath: prepared.rootPath, prompt, timeoutMs: this.timeoutMs, mode: writeApproved ? "workspace-write" : "read-only", onEvent: (event) => event.type === "message" ? this.streaming.appendResponse(responseTs!, event.text) : this.streaming.setProgress(responseTs!, event.text) });
+      const result = await this.codex.run({
+        workspacePath: prepared.rootPath,
+        prompt,
+        timeoutMs: this.timeoutMs,
+        mode: writeApproved ? "workspace-write" : "read-only",
+        threadId: activeInvestigation.codexThreadId ?? undefined,
+        onThreadStarted: async (threadId) => { await this.repository.setCodexThreadId(activeInvestigation.id, threadId); },
+        onEvent: (event) => {
+          if (event.type === "message") this.streaming.appendResponse(responseTs!, event.text);
+          else if (event.type === "plan") this.streaming.setPlan(responseTs!, event.title, event.steps);
+          else if (event.type === "task" || event.type === "file_change") this.streaming.updateTask(responseTs!, event);
+        },
+      });
       if (result.exitCode !== 0) throw new Error(result.error ?? `Codex exited with code ${result.exitCode}`);
+      if (result.codexThreadId && result.codexThreadId !== activeInvestigation.codexThreadId) await this.repository.setCodexThreadId(activeInvestigation.id, result.codexThreadId);
       const findings = codexOutputToText(result.output);
       await this.appendInvestigationMarkdown(prepared.rootPath, fetched.key, fetched.summary, question, findings);
       await this.repository.addEvent(activeInvestigation.id, InvestigationEventType.AGENT_COMPLETED, "codex", findings, { exitCode: result.exitCode });

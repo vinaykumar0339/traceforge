@@ -64,6 +64,7 @@ model Investigation {
   status           InvestigationStatus @default(CREATED)
   currentQuestion  String?
   workspacePath    String?
+  codexThreadId    String?
   latestSummary    String?
   latestFindings   Json?
   metadata         Json?

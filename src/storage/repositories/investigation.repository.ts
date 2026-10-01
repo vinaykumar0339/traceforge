@@ -106,6 +106,10 @@ export class InvestigationRepository {
     } });
   }
 
+  async setCodexThreadId(id: string, codexThreadId: string): Promise<void> {
+    await this.db.investigation.update({ where: { id }, data: { codexThreadId } });
+  }
+
   async addEvent(investigationId: string, type: InvestigationEventType, source: string, content: string, metadata?: unknown): Promise<void> {
     await this.db.investigationEvent.create({ data: { investigationId, type, source, content, metadata: metadata === undefined ? undefined : json(metadata) } });
   }

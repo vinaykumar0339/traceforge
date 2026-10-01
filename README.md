@@ -24,7 +24,9 @@ branch: bugfix/codex-TF-7-save-fails
 
 The worktree uses the configured `branch` (normally `main`) as its starting point. Creating a Git worktree shares Git objects with the original checkout and leaves its checked-out branch and files unchanged. Codex is invoked with a read-only sandbox, so investigations do not modify application code. Worktrees and branches remain available for later, explicitly approved fixes.
 
-Install and authenticate the Codex CLI on the host running Traceforge, then leave `CODEX_COMMAND=codex` or point it to its absolute executable path. The runner executes `codex exec` with argument arrays (never a shell string), the investigation workspace as its working directory, and a read-only sandbox.
+Install and authenticate a current Codex CLI on the host running Traceforge, then leave `CODEX_COMMAND=codex` or point it to its absolute executable path. The runner starts `codex app-server` as a private stdio process (never a network listener), then uses JSON-RPC to start or resume a Codex thread for the investigation. The stored thread ID means a Slack follow-up continues the same Codex conversation.
+
+App Server emits message deltas, plan updates, command lifecycle events, and file-change events. Traceforge turns them into native Slack streaming chunks and task cards when supported, or throttled rich Block Kit updates otherwise. It never sends raw command output or internal reasoning to Slack.
 
 The prompt is built dynamically. Its effective context has this shape:
 
