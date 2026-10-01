@@ -14,7 +14,7 @@ export class InvestigationContextBuilder {
     try { investigationMarkdown = await fs.readFile(path.join(workspacePath, "investigation.md"), "utf8"); } catch { /* first run */ }
     return {
       jira: normalizeJiraIssue(investigation.jiraIssue.snapshot),
-      repositories: investigation.repositorySnapshots.map((snapshot) => ({ repositoryName: snapshot.repositoryName, platform: snapshot.platform ?? undefined, sourcePath: snapshot.sourcePath, workspacePath: snapshot.workspacePath, branch: snapshot.branch, commitSha: snapshot.commitSha })),
+      repositories: investigation.repositorySnapshots.map((snapshot) => ({ repositoryName: snapshot.repositoryName, platform: snapshot.platform ?? undefined, sourcePath: snapshot.sourcePath, workspacePath: snapshot.workspacePath, branch: snapshot.branch, commitSha: snapshot.commitSha, sourceUrlTemplate: snapshot.sourceUrlTemplate ?? undefined })),
       previousFindings: investigation.latestFindings,
       recentEvents: investigation.events.map((event) => ({ type: event.type, source: event.source, content: event.content, createdAt: event.createdAt })),
       currentQuestion,

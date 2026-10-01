@@ -110,6 +110,7 @@ model RepositorySnapshot {
   workspacePath   String
   branch          String
   commitSha       String
+  sourceUrlTemplate String?
   lastUpdatedAt   DateTime      @default(now())
   @@unique([investigationId, repositoryName])
 }

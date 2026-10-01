@@ -4,6 +4,8 @@ repositories:
     platform: backend
     path: /absolute/path/to/backend
     branch: main
+    # Optional: makes Slack source evidence clickable. {ref}, {path}, {file}, and {line} are replaced safely.
+    sourceUrlTemplate: https://bitbucket.org/your-workspace/backend/src/{ref}/{path}#{file}-{line}
   - name: mobile
     platform: react-native
     path: /absolute/path/to/mobile

@@ -93,7 +93,7 @@ export class InvestigationService {
       await this.repository.addEvent(activeInvestigation.id, InvestigationEventType.AGENT_COMPLETED, "codex", findings, { exitCode: result.exitCode });
       await this.repository.addEvent(activeInvestigation.id, InvestigationEventType.FINDING_ADDED, "codex", findings);
       await this.repository.setStatus(activeInvestigation.id, InvestigationStatus.COMPLETED, { summary: findings.slice(0, 1_000), findings, question: null });
-      await this.streaming.finishResponse(responseTs, this.formatter.complete(fetched, findings));
+      await this.streaming.finishResponse(responseTs, this.formatter.complete(fetched, findings, prepared.snapshots));
       await this.repository.completeJob(job.id);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);

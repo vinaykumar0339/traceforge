@@ -24,6 +24,14 @@ branch: bugfix/codex-TF-7-save-fails
 
 The worktree uses the configured `branch` (normally `main`) as its starting point. Creating a Git worktree shares Git objects with the original checkout and leaves its checked-out branch and files unchanged. Codex is invoked with a read-only sandbox, so investigations do not modify application code. Worktrees and branches remain available for later, explicitly approved fixes.
 
+Slack cannot open filesystem paths such as `/Users/.../Login.java:122`. Traceforge therefore displays those as compact source evidence, for example `android/library/Login.java:122`. To make the evidence a clickable hosted-source permalink, optionally add `sourceUrlTemplate` to each repository. Use `{ref}`, `{path}`, `{file}`, and `{line}` as placeholders. For Bitbucket Cloud:
+
+```yaml
+sourceUrlTemplate: https://bitbucket.org/your-workspace/android/src/{ref}/{path}#{file}-{line}
+```
+
+Traceforge replaces `{ref}` with the captured commit SHA, `{path}` with the repository-relative path, `{file}` with its final file name, and `{line}` with the source line. The link stays pinned to the source revision that Codex investigated. Keep this unset when the repository has no browser-accessible URL.
+
 Install and authenticate a current Codex CLI on the host running Traceforge, then leave `CODEX_COMMAND=codex` or point it to its absolute executable path. The runner starts `codex app-server` as a private stdio process (never a network listener), then uses JSON-RPC to start or resume a Codex thread for the investigation. The stored thread ID means a Slack follow-up continues the same Codex conversation.
 
 App Server emits message deltas, plan updates, command lifecycle events, and file-change events. Traceforge turns them into native Slack streaming chunks and task cards when supported, or throttled rich Block Kit updates otherwise. It never sends raw command output or internal reasoning to Slack.

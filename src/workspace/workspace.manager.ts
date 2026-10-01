@@ -15,6 +15,7 @@ export interface WorkspaceSnapshot {
   workspacePath: string;
   branch: string;
   commitSha: string;
+  sourceUrlTemplate?: string;
 }
 
 export class WorkspaceManager {
@@ -43,7 +44,7 @@ export class WorkspaceManager {
     const topLevel = (await this.git(workspacePath, ["rev-parse", "--show-toplevel"])).trim();
     if (!(await this.samePath(topLevel, workspacePath))) throw new Error(`Workspace path is not a Git worktree: ${workspacePath}`);
     const commitSha = (await this.git(workspacePath, ["rev-parse", "HEAD"])).trim();
-    return { repositoryName: repository.name, platform: repository.platform, sourcePath: repository.path, workspacePath, branch, commitSha };
+    return { repositoryName: repository.name, platform: repository.platform, sourcePath: repository.path, workspacePath, branch, commitSha, sourceUrlTemplate: repository.sourceUrlTemplate };
   }
 
   private async resolveBaseRef(repository: RepositoryConfig): Promise<string> {

@@ -117,8 +117,8 @@ export class InvestigationRepository {
   async saveSnapshots(investigationId: string, snapshots: WorkspaceSnapshot[]): Promise<void> {
     await this.db.$transaction(snapshots.map((snapshot) => this.db.repositorySnapshot.upsert({
       where: { investigationId_repositoryName: { investigationId, repositoryName: snapshot.repositoryName } },
-      create: { investigationId, repositoryName: snapshot.repositoryName, platform: snapshot.platform, sourcePath: snapshot.sourcePath, workspacePath: snapshot.workspacePath, branch: snapshot.branch, commitSha: snapshot.commitSha },
-      update: { platform: snapshot.platform, sourcePath: snapshot.sourcePath, workspacePath: snapshot.workspacePath, branch: snapshot.branch, commitSha: snapshot.commitSha, lastUpdatedAt: new Date() },
+      create: { investigationId, repositoryName: snapshot.repositoryName, platform: snapshot.platform, sourcePath: snapshot.sourcePath, workspacePath: snapshot.workspacePath, branch: snapshot.branch, commitSha: snapshot.commitSha, sourceUrlTemplate: snapshot.sourceUrlTemplate },
+      update: { platform: snapshot.platform, sourcePath: snapshot.sourcePath, workspacePath: snapshot.workspacePath, branch: snapshot.branch, commitSha: snapshot.commitSha, sourceUrlTemplate: snapshot.sourceUrlTemplate, lastUpdatedAt: new Date() },
     })));
   }
 

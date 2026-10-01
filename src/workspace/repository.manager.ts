@@ -8,6 +8,7 @@ const repositorySchema = z.object({
   platform: z.string().min(1).optional(),
   path: z.string().min(1),
   branch: z.string().min(1),
+  sourceUrlTemplate: z.string().url().includes("{ref}").includes("{path}").optional(),
 });
 const fileSchema = z.object({ repositories: z.array(repositorySchema).min(1) });
 export type RepositoryConfig = z.infer<typeof repositorySchema>;
