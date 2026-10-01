@@ -95,7 +95,7 @@ SLACK_APPROVER_USER_IDS=U0123456789,U9876543210
 SLACK_APPROVAL_TIMEOUT_MINUTES=60
 ```
 
-Read-only investigation never needs approval. A request to create/apply/implement a patch creates a durable approval card in the investigation thread. Only configured approvers can use its signed **Approve write access** or **Reject** actions. Approval allows Codex to modify the ticket's isolated worktrees only; it never permits writes to the configured source checkouts.
+Before a Slack follow-up can change code, Traceforge asks Codex through a constrained, read-only intent gate to classify the request semantically as read-only, patch, commit, push, or uncertain. It does not use keyword matching. Patch, commit, and push requests receive a durable approval card that states the exact scope; uncertain requests fail closed as read-only. Only configured approvers can use these signed actions. A change-and-push approval additionally allows a normal (never force) push of that ticket branch to `origin`; it never alters the configured source checkout or another branch.
 
 Example conversation:
 

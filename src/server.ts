@@ -11,6 +11,7 @@ import { SlackFormatter } from "./slack/slack.service.js";
 import { CodexRunner } from "./agent/codex.runner.js";
 import { InvestigationService } from "./investigation/investigation.service.js";
 import { InvestigationQueue } from "./investigation/investigation.queue.js";
+import { WriteIntentClassifier } from "./investigation/write-intent.js";
 import { createApp } from "./app.js";
 
 async function main(): Promise<void> {
@@ -23,7 +24,9 @@ async function main(): Promise<void> {
   const workspace = new WorkspaceManager(config.WORKSPACE_ROOT, repositories, logger);
   const formatter = new SlackFormatter();
   const streaming = new SlackStreamingService(new SlackClient(config.SLACK_BOT_TOKEN), config.SLACK_UPDATE_INTERVAL_MS, config.SLACK_STREAMING_MODE);
-  const service = new InvestigationService(repository, new JiraClient(config), workspace, new CodexRunner(config.CODEX_COMMAND), streaming, formatter, config.CODEX_TIMEOUT_MS, config.SLACK_CHANNEL_ID, config.SLACK_APPROVAL_TIMEOUT_MINUTES, logger);
+  const codex = new CodexRunner(config.CODEX_COMMAND);
+  const writeIntent = new WriteIntentClassifier(codex, Math.min(config.CODEX_TIMEOUT_MS, 60_000), process.cwd());
+  const service = new InvestigationService(repository, new JiraClient(config), workspace, codex, streaming, formatter, config.CODEX_TIMEOUT_MS, config.SLACK_CHANNEL_ID, config.SLACK_APPROVAL_TIMEOUT_MINUTES, writeIntent, logger);
   const queue = new InvestigationQueue(repository, service, logger);
   await queue.start();
   const app = createApp({ config, db, repository, queue, logger, streaming, formatter });

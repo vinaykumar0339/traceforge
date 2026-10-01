@@ -37,6 +37,8 @@ enum JobStatus {
 
 enum ApprovalAction {
   CREATE_PATCH
+  CREATE_AND_COMMIT
+  CREATE_AND_PUSH
 }
 
 enum ApprovalStatus {

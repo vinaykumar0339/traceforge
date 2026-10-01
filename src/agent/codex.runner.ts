@@ -6,6 +6,8 @@ export interface CodexRunOptions {
   prompt: string;
   timeoutMs: number;
   mode?: "read-only" | "workspace-write";
+  allowNetwork?: boolean;
+  outputSchema?: Record<string, unknown>;
   threadId?: string;
   onThreadStarted?: (threadId: string) => void | Promise<void>;
   onEvent?: (event: CodexStreamEvent) => void;
@@ -36,7 +38,7 @@ export class CodexRunner {
       const child = spawn(this.command, ["app-server"], { cwd: options.workspacePath, shell: false, stdio: ["pipe", "pipe", "pipe"] });
       const sandbox = options.mode === "workspace-write" ? "workspace-write" : "read-only";
       const sandboxPolicy = options.mode === "workspace-write"
-        ? { type: "workspaceWrite", writableRoots: [options.workspacePath], networkAccess: false }
+        ? { type: "workspaceWrite", writableRoots: [options.workspacePath], networkAccess: options.allowNetwork ?? false }
         : { type: "readOnly", networkAccess: false };
       const pending = new Map<number, { resolve: (value: Record<string, unknown>) => void; reject: (error: Error) => void }>();
       const agentMessageIds = new Set<string>();
@@ -131,7 +133,7 @@ export class CodexRunner {
           if (!threadRecord || typeof threadRecord.id !== "string") throw new Error("Codex App Server did not return a thread ID");
           threadId = threadRecord.id;
           await options.onThreadStarted?.(threadId);
-          const turn = await request("turn/start", { threadId, input: [{ type: "text", text: options.prompt }], cwd: options.workspacePath, sandboxPolicy, approvalPolicy: "never" });
+          const turn = await request("turn/start", { threadId, input: [{ type: "text", text: options.prompt }], cwd: options.workspacePath, sandboxPolicy, approvalPolicy: "never", outputSchema: options.outputSchema });
           const turnRecord = isRecord(turn.turn) ? turn.turn : undefined;
           turnId = typeof turnRecord?.id === "string" ? turnRecord.id : undefined;
         } catch (error) {

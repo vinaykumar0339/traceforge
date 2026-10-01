@@ -1,6 +1,6 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import { InvestigationEventType, InvestigationStatus, type InvestigationJob } from "@prisma/client";
+import { ApprovalAction, InvestigationEventType, InvestigationStatus, type InvestigationJob } from "@prisma/client";
 import type { Logger } from "pino";
 import { CodexRunner } from "../agent/codex.runner.js";
 import { buildCodexPrompt } from "../agent/codex.context.js";
@@ -12,6 +12,7 @@ import { SlackStreamingService } from "../slack/slack.streaming.js";
 import { InvestigationRepository } from "../storage/repositories/investigation.repository.js";
 import { WorkspaceManager } from "../workspace/workspace.manager.js";
 import { InvestigationContextBuilder } from "./investigation.context.js";
+import { type WriteScope, WriteIntentClassifier } from "./write-intent.js";
 
 export class InvestigationService {
   private readonly contextBuilder: InvestigationContextBuilder;
@@ -25,6 +26,7 @@ export class InvestigationService {
     private readonly timeoutMs: number,
     private readonly slackChannelId: string,
     private readonly approvalTimeoutMinutes: number,
+    private readonly writeIntent: WriteIntentClassifier,
     private readonly logger: Logger,
   ) { this.contextBuilder = new InvestigationContextBuilder(repository); }
 
@@ -53,11 +55,12 @@ export class InvestigationService {
       const question = job.type === "JIRA_SYNC" ? null : ((job.payload as { question?: unknown }).question as string | undefined) ?? activeInvestigation.currentQuestion;
       const requester = (job.payload as { requester?: { userId?: string; teamId?: string } }).requester;
       const writeApproved = job.type === "APPROVED_WRITE";
-      if (!writeApproved && question && requiresPatchApproval(question)) {
+      const writeScope = !writeApproved && question ? await this.classifyWriteIntent(question) : "READ_ONLY";
+      if (!writeApproved && question && requiresApproval(writeScope)) {
         let approval = await this.repository.getApprovalForJob(job.id);
         if (!approval) {
-          approval = await this.repository.createPatchApproval({ investigationId: activeInvestigation.id, jobId: job.id, question, requestedByUserId: requester?.userId, channelId: thread.channelId, threadTs: thread.threadTs, expiresAt: new Date(Date.now() + this.approvalTimeoutMinutes * 60_000) });
-          const message = await this.streaming.postThreadMessage(thread.channelId, thread.threadTs, this.formatter.approval({ issueKey: fetched.key, summary: fetched.summary, approvalId: approval.id, question, expiresAt: approval.expiresAt }));
+          approval = await this.repository.createPatchApproval({ investigationId: activeInvestigation.id, jobId: job.id, action: approvalAction(writeScope), question, requestedByUserId: requester?.userId, channelId: thread.channelId, threadTs: thread.threadTs, expiresAt: new Date(Date.now() + this.approvalTimeoutMinutes * 60_000) });
+          const message = await this.streaming.postThreadMessage(thread.channelId, thread.threadTs, this.formatter.approval({ issueKey: fetched.key, summary: fetched.summary, approvalId: approval.id, question, expiresAt: approval.expiresAt, scope: writeScope }));
           await this.repository.attachApprovalMessage(approval.id, message.ts);
           await this.repository.addEvent(activeInvestigation.id, InvestigationEventType.AGENT_OUTPUT, "orchestrator", "Awaiting approval for workspace write access", { approvalId: approval.id });
         }
@@ -70,7 +73,9 @@ export class InvestigationService {
       await this.repository.saveSnapshots(activeInvestigation.id, prepared.snapshots);
       await this.repository.setStatus(activeInvestigation.id, InvestigationStatus.INVESTIGATING, { workspacePath: prepared.rootPath });
       const context = await this.contextBuilder.build(activeInvestigation.id, prepared.rootPath, question ?? null);
-      const prompt = buildCodexPrompt(context, writeApproved);
+      const allowCommit = writeApproved && (job.payload as { allowCommit?: unknown }).allowCommit === true;
+      const allowPublish = writeApproved && (job.payload as { allowPublish?: unknown }).allowPublish === true;
+      const prompt = buildCodexPrompt(context, writeApproved, allowCommit, allowPublish);
       await this.repository.addEvent(activeInvestigation.id, InvestigationEventType.AGENT_STARTED, "codex", question ?? "Initial investigation");
       responseTs = await this.streaming.startResponse(thread.channelId, thread.threadTs, this.formatter.progress(question), requester);
       const result = await this.codex.run({
@@ -78,6 +83,7 @@ export class InvestigationService {
         prompt,
         timeoutMs: this.timeoutMs,
         mode: writeApproved ? "workspace-write" : "read-only",
+        allowNetwork: allowPublish,
         threadId: activeInvestigation.codexThreadId ?? undefined,
         onThreadStarted: async (threadId) => { await this.repository.setCodexThreadId(activeInvestigation.id, threadId); },
         onEvent: (event) => {
@@ -111,8 +117,12 @@ export class InvestigationService {
     try { await fs.access(file); } catch { await fs.writeFile(file, `# ${issueKey} Investigation\n\n## Jira\n\n${summary}\n`, "utf8"); }
     await fs.appendFile(file, `\n## ${heading} — ${new Date().toISOString()}\n\n${question ? `Question: ${question}\n\n` : ""}${findings}\n`, "utf8");
   }
+
+  private async classifyWriteIntent(question: string): Promise<WriteScope> {
+    try { return await this.writeIntent.classify(question); }
+    catch (error) { this.logger.warn({ err: error }, "Could not classify Slack authorization intent; keeping the request read-only"); return "UNCERTAIN"; }
+  }
 }
 
-function requiresPatchApproval(question: string): boolean {
-  return /\b(create|apply|implement|make|write|modify)\b.{0,40}\b(patch|fix|change|code)\b|\bfix (it|this|the issue)\b/i.test(question);
-}
+function requiresApproval(scope: WriteScope): scope is "PATCH" | "COMMIT" | "PUSH" { return scope !== "READ_ONLY" && scope !== "UNCERTAIN"; }
+function approvalAction(scope: "PATCH" | "COMMIT" | "PUSH"): ApprovalAction { return scope === "PUSH" ? ApprovalAction.CREATE_AND_PUSH : scope === "COMMIT" ? ApprovalAction.CREATE_AND_COMMIT : ApprovalAction.CREATE_PATCH; }

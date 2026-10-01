@@ -134,8 +134,8 @@ export class InvestigationRepository {
     await this.db.investigationJob.update({ where: { id }, data: { status: JobStatus.FAILED, completedAt: new Date(), error } });
   }
 
-  async createPatchApproval(input: { investigationId: string; jobId: string; question: string; requestedByUserId?: string; channelId: string; threadTs: string; expiresAt: Date }) {
-    return this.db.approvalRequest.create({ data: { investigationId: input.investigationId, jobId: input.jobId, action: ApprovalAction.CREATE_PATCH, question: input.question, requestedByUserId: input.requestedByUserId, slackChannelId: input.channelId, slackThreadTs: input.threadTs, expiresAt: input.expiresAt } });
+  async createPatchApproval(input: { investigationId: string; jobId: string; action: ApprovalAction; question: string; requestedByUserId?: string; channelId: string; threadTs: string; expiresAt: Date }) {
+    return this.db.approvalRequest.create({ data: { investigationId: input.investigationId, jobId: input.jobId, action: input.action, question: input.question, requestedByUserId: input.requestedByUserId, slackChannelId: input.channelId, slackThreadTs: input.threadTs, expiresAt: input.expiresAt } });
   }
 
   async attachApprovalMessage(approvalId: string, messageTs: string): Promise<void> {
@@ -155,7 +155,7 @@ export class InvestigationRepository {
       }
       const status = approved ? ApprovalStatus.APPROVED : ApprovalStatus.REJECTED;
       const decided = await tx.approvalRequest.update({ where: { id: approval.id }, data: { status, approvedByUserId: userId, decisionAt: new Date() } });
-      if (approved) await tx.investigationJob.create({ data: { investigationId: approval.investigationId, type: "APPROVED_WRITE", payload: json({ question: approval.question, approvalId: approval.id }), dedupeKey: `approval:${approval.id}` } });
+      if (approved) await tx.investigationJob.create({ data: { investigationId: approval.investigationId, type: "APPROVED_WRITE", payload: json({ question: approval.question, approvalId: approval.id, allowCommit: approval.action === ApprovalAction.CREATE_AND_COMMIT || approval.action === ApprovalAction.CREATE_AND_PUSH, allowPublish: approval.action === ApprovalAction.CREATE_AND_PUSH }), dedupeKey: `approval:${approval.id}` } });
       return { approval: decided, changed: true };
     });
   }
