@@ -4,15 +4,19 @@ import { ApprovalAction, InvestigationEventType, InvestigationStatus, type Inves
 import type { Logger } from "pino";
 import { CodexRunner } from "../agent/codex.runner.js";
 import { buildCodexPrompt } from "../agent/codex.context.js";
-import { codexOutputToText } from "../agent/codex.parser.js";
 import { JiraClient } from "../jira/jira.client.js";
 import { normalizeJiraIssue } from "../jira/jira.service.js";
 import { SlackFormatter } from "../slack/slack.service.js";
+import { CodexToSlackMapper } from "../slack/codex-to-slack.js";
 import { SlackStreamingService } from "../slack/slack.streaming.js";
 import { InvestigationRepository } from "../storage/repositories/investigation.repository.js";
 import { WorkspaceManager } from "../workspace/workspace.manager.js";
 import { InvestigationContextBuilder } from "./investigation.context.js";
 import { type WriteScope, WriteIntentClassifier } from "./write-intent.js";
+
+class CodexTimeoutError extends Error {
+  constructor(message: string) { super(message); this.name = "CodexTimeoutError"; }
+}
 
 export class InvestigationService {
   private readonly contextBuilder: InvestigationContextBuilder;
@@ -25,7 +29,6 @@ export class InvestigationService {
     private readonly streaming: SlackStreamingService,
     private readonly formatter: SlackFormatter,
     private readonly timeoutMs: number,
-    private readonly slackChannelId: string,
     private readonly approvalTimeoutMinutes: number,
     private readonly writeIntent: WriteIntentClassifier,
     private readonly logger: Logger,
@@ -60,18 +63,11 @@ export class InvestigationService {
       investigation = await this.repository.getInvestigation(job.investigationId);
       if (!investigation) throw new Error(`Investigation not found after Jira refresh: ${job.investigationId}`);
 
-      let thread = investigation.slackThread;
-      if (!thread) {
-        // Slack owns the root message; persistence owns its stable mapping.
-        const root = await this.streaming.postRootMessage(this.slackChannelId, this.formatter.initial(fetched));
-        await this.repository.ensureSlackThread(investigation.id, this.slackChannelId, root.ts);
-        investigation = await this.repository.getInvestigation(job.investigationId);
-        thread = investigation?.slackThread ?? null;
-      }
-      if (!investigation || !thread) throw new Error("Could not establish Slack investigation thread");
+      const thread = investigation.slackThread;
+      if (!thread) throw new Error("Socket Mode investigation is missing its Slack thread mapping");
       const activeInvestigation = investigation;
 
-      const question = job.type === "JIRA_SYNC" ? null : ((job.payload as { question?: unknown }).question as string | undefined) ?? activeInvestigation.currentQuestion;
+      const question = ((job.payload as { question?: unknown }).question as string | undefined) ?? activeInvestigation.currentQuestion;
       const requester = (job.payload as { requester?: { userId?: string; teamId?: string } }).requester;
       const writeApproved = job.type === "APPROVED_WRITE";
       const writeScope = !writeApproved && question ? await this.classifyWriteIntent(question) : "READ_ONLY";
@@ -98,7 +94,13 @@ export class InvestigationService {
       await this.repository.addEvent(activeInvestigation.id, InvestigationEventType.AGENT_STARTED, "codex", question ?? "Initial investigation");
       const controls = await this.streaming.postThreadMessage(thread.channelId, thread.threadTs, this.formatter.runControls({ investigationId: activeInvestigation.id, issueKey: fetched.key, summary: fetched.summary }));
       controlTs = controls.ts;
-      responseTs = await this.streaming.startResponse(thread.channelId, thread.threadTs, this.formatter.progress(question), requester);
+      try {
+        responseTs = await this.streaming.startResponse(thread.channelId, thread.threadTs, this.formatter.progress(question), requester);
+      } catch (error) {
+        this.logger.error({ err: error, investigationId: activeInvestigation.id }, "Could not start Slack response stream");
+        throw error;
+      }
+      const codexToSlack = new CodexToSlackMapper(this.streaming, responseTs);
       activeRun = { controller: new AbortController(), disposition: "paused" };
       this.activeRuns.set(activeInvestigation.id, activeRun);
       const result = await this.codex.run({
@@ -111,20 +113,22 @@ export class InvestigationService {
         signal: activeRun.controller.signal,
         threadId: activeInvestigation.codexThreadId ?? undefined,
         onThreadStarted: async (threadId) => { await this.repository.setCodexThreadId(activeInvestigation.id, threadId); },
-        onEvent: (event) => {
-          if (event.type === "message") this.streaming.appendResponse(responseTs!, event.text);
-          else if (event.type === "plan") this.streaming.setPlan(responseTs!, event.title, event.steps);
-          else if (event.type === "task" || event.type === "file_change") this.streaming.updateTask(responseTs!, event);
-        },
+        onEvent: (event) => codexToSlack.handle(event),
       });
-      if (result.exitCode !== 0) throw new Error(result.error ?? `Codex exited with code ${result.exitCode}`);
       if (result.codexThreadId && result.codexThreadId !== activeInvestigation.codexThreadId) await this.repository.setCodexThreadId(activeInvestigation.id, result.codexThreadId);
-      const findings = codexOutputToText(result.output);
+      if (result.timedOut) throw new CodexTimeoutError(result.error ?? "Codex reached its configured time limit.");
+      if (result.exitCode !== 0) throw new Error(result.error ?? `Codex exited with code ${result.exitCode}`);
+      const findings = result.output.trim() || "Codex completed without a user-facing response.";
       await this.appendInvestigationMarkdown(prepared.rootPath, fetched.key, fetched.summary, question, findings);
       await this.repository.addEvent(activeInvestigation.id, InvestigationEventType.AGENT_COMPLETED, "codex", findings, { exitCode: result.exitCode });
       await this.repository.addEvent(activeInvestigation.id, InvestigationEventType.FINDING_ADDED, "codex", findings);
       await this.repository.setStatus(activeInvestigation.id, InvestigationStatus.COMPLETED, { summary: findings.slice(0, 1_000), findings, question: null });
-      await this.streaming.finishResponse(responseTs, this.formatter.complete(fetched, findings, prepared.snapshots));
+      try {
+        await this.streaming.finishResponse(responseTs, this.formatter.complete(fetched, findings, prepared.snapshots));
+      } catch (error) {
+        // Codex has completed successfully; a Slack delivery failure must not mislabel the investigation as failed.
+        this.logger.error({ err: error, investigationId: activeInvestigation.id }, "Could not finalize Slack response stream");
+      }
       await this.streaming.updateMessage(thread.channelId, controlTs, this.formatter.finishedControls(fetched.key));
       await this.repository.completeJob(job.id);
     } catch (error) {
@@ -137,7 +141,18 @@ export class InvestigationService {
         await this.repository.addEvent(job.investigationId, InvestigationEventType.AGENT_COMPLETED, "orchestrator", cancelled ? "Investigation dismissed from Slack" : "Investigation paused from Slack").catch(() => undefined);
         await this.repository.completeJob(job.id).catch(() => undefined);
         if (responseTs) await this.streaming.finishResponse(responseTs, cancelled ? this.formatter.dismissed(issue?.key ?? "Investigation") : this.formatter.pausedControls({ investigationId: job.investigationId, issueKey: issue?.key ?? "Investigation" })).catch(() => undefined);
-        if (controlTs && investigation) await this.streaming.updateMessage(investigation.slackThread?.channelId ?? this.slackChannelId, controlTs, cancelled ? this.formatter.dismissed(issue?.key ?? "Investigation") : this.formatter.pausedControls({ investigationId: job.investigationId, issueKey: issue?.key ?? "Investigation" })).catch(() => undefined);
+        if (controlTs && investigation?.slackThread) await this.streaming.updateMessage(investigation.slackThread.channelId, controlTs, cancelled ? this.formatter.dismissed(issue?.key ?? "Investigation") : this.formatter.pausedControls({ investigationId: job.investigationId, issueKey: issue?.key ?? "Investigation" })).catch(() => undefined);
+        return;
+      }
+      if (error instanceof CodexTimeoutError) {
+        const investigation = await this.repository.getInvestigation(job.investigationId).catch(() => null);
+        const issueKey = investigation ? normalizeJiraIssue(investigation.jiraIssue.snapshot).key : "Investigation";
+        const paused = this.formatter.pausedControls({ investigationId: job.investigationId, issueKey, reason: "Codex reached its configured time limit. Continue resumes this investigation from its saved context." });
+        await this.repository.setStatus(job.investigationId, InvestigationStatus.PAUSED).catch(() => undefined);
+        await this.repository.addEvent(job.investigationId, InvestigationEventType.AGENT_COMPLETED, "orchestrator", "Investigation paused because Codex reached its configured time limit", { timeoutMs: this.timeoutMs }).catch(() => undefined);
+        await this.repository.completeJob(job.id).catch(() => undefined);
+        if (responseTs) await this.streaming.finishResponse(responseTs, paused).catch(() => undefined);
+        if (controlTs && investigation?.slackThread) await this.streaming.updateMessage(investigation.slackThread.channelId, controlTs, paused).catch(() => undefined);
         return;
       }
       const message = error instanceof Error ? error.message : String(error);
@@ -145,7 +160,7 @@ export class InvestigationService {
       await this.repository.addEvent(job.investigationId, InvestigationEventType.AGENT_ERROR, "orchestrator", message).catch(() => undefined);
       await this.repository.setStatus(job.investigationId, InvestigationStatus.FAILED).catch(() => undefined);
       await this.repository.failJob(job.id, message).catch(() => undefined);
-      if (responseTs) await this.streaming.sendError(responseTs, this.formatter.error(message)).catch(() => undefined);
+      if (responseTs) await this.streaming.sendError(responseTs, this.formatter.error(message)).catch((slackError) => this.logger.error({ err: slackError, jobId: job.id }, "Could not finalize Slack error response"));
     } finally {
       if (activeRun && this.activeRuns.get(job.investigationId) === activeRun) this.activeRuns.delete(job.investigationId);
     }

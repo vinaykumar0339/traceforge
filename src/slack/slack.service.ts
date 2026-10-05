@@ -3,10 +3,25 @@ import type { SlackBlock, SlackMessage } from "./slack.client.js";
 import type { WorkspaceSnapshot } from "../workspace/workspace.manager.js";
 
 export class SlackFormatter {
-  initial(issue: NormalizedJiraIssue): SlackMessage { return { text: `Jira investigation started: ${issue.key} — ${issue.summary}`, blocks: [{ type: "header", text: { type: "plain_text", text: "🔎 Jira investigation started" } }, { type: "section", text: { type: "mrkdwn", text: `*${issue.key} — ${issue.summary}*` }, fields: [{ type: "mrkdwn", text: "*Status*\nInvestigating" }, { type: "mrkdwn", text: `*Priority*\n${issue.priority ?? "Not set"}` }, { type: "mrkdwn", text: `*Reporter*\n${issue.reporter ?? "Unassigned"}` }, { type: "mrkdwn", text: `*Assignee*\n${issue.assignee ?? "Unassigned"}` }] }, { type: "context", elements: [{ type: "mrkdwn", text: "Reply in this thread to ask follow-up questions." }] }] }; }
+  investigationStarted(input: { issueKey: string; summary: string; requesterUserId: string }): SlackMessage {
+    return {
+      text: `Investigation started: ${input.issueKey}`,
+      blocks: [
+        { type: "header", text: { type: "plain_text", text: "🔍 Investigation started" } },
+        { type: "section", text: { type: "mrkdwn", text: `*${input.issueKey} — ${input.summary}*\nRequested by <@${input.requesterUserId}>. Traceforge will post all investigation updates in this thread.` } },
+      ],
+    };
+  }
+  investigationRouted(input: { issueKey: string; investigationChannelId: string }): SlackMessage {
+    return { text: `Started ${input.issueKey} in <#${input.investigationChannelId}>.`, blocks: [{ type: "section", text: { type: "mrkdwn", text: `🔍 Started *${input.issueKey}* in <#${input.investigationChannelId}>. Follow the investigation thread there for updates.` } }] };
+  }
+  unsupportedRequest(): SlackMessage {
+    return { text: "I can only investigate Jira tickets.", blocks: [{ type: "section", text: { type: "mrkdwn", text: "I can only investigate Jira tickets. Tag me with a Jira key or link, for example `@Traceforge investigate TAI-4`." } }] };
+  }
   progress(question: string | null): SlackMessage { return { text: "Investigation in progress", blocks: [{ type: "header", text: { type: "plain_text", text: "🔍 Investigation in progress" } }, { type: "section", text: { type: "mrkdwn", text: question ? `*Question*\n${question}` : "Preparing workspaces and tracing the relevant code path." } }] }; }
   runControls(input: { investigationId: string; issueKey: string; summary: string }): SlackMessage { return { text: `Codex is working on ${input.issueKey}`, blocks: [{ type: "section", text: { type: "mrkdwn", text: `*⏳ Codex is working*\n${input.issueKey} — ${input.summary}` } }, { type: "actions", block_id: `control-${input.investigationId}`, elements: [{ type: "button", text: { type: "plain_text", text: "Stop" }, style: "danger", action_id: "investigation_stop", value: input.investigationId, confirm: { title: { type: "plain_text", text: "Stop this investigation?" }, text: { type: "mrkdwn", text: "Codex will stop at the next safe interruption point. You can continue later." }, confirm: { type: "plain_text", text: "Stop" }, deny: { type: "plain_text", text: "Keep working" } } }] }] }; }
   stopping(issueKey: string): SlackMessage { return { text: `Stopping ${issueKey}`, blocks: [{ type: "section", text: { type: "mrkdwn", text: `*⏳ Stopping ${issueKey}…*\nWaiting for Codex to finish its current safe operation.` } }] }; }
+  inactiveRun(issueKey: string): SlackMessage { return { text: `${issueKey} is no longer running`, blocks: [{ type: "section", text: { type: "mrkdwn", text: `*ℹ️ No active run to stop*\n${issueKey} had already finished, paused, or been dismissed. This Stop control has been retired.` } }] }; }
   pausedControls(input: { investigationId: string; issueKey: string; reason?: string }): SlackMessage { return { text: `${input.issueKey} paused`, blocks: [{ type: "section", text: { type: "mrkdwn", text: `*⏸ Investigation paused*\n${input.reason ?? "Codex was stopped. You can continue from the saved investigation context or dismiss it."}` } }, { type: "actions", block_id: `paused-${input.investigationId}`, elements: [{ type: "button", text: { type: "plain_text", text: "Continue" }, style: "primary", action_id: "investigation_continue", value: input.investigationId }, { type: "button", text: { type: "plain_text", text: "Dismiss" }, style: "danger", action_id: "investigation_dismiss", value: input.investigationId, confirm: { title: { type: "plain_text", text: "Dismiss investigation?" }, text: { type: "mrkdwn", text: "This cancels queued work. Existing worktree changes are retained but Codex will not continue automatically." }, confirm: { type: "plain_text", text: "Dismiss" }, deny: { type: "plain_text", text: "Keep paused" } } }] }] }; }
   resuming(issueKey: string): SlackMessage { return { text: `${issueKey} resuming`, blocks: [{ type: "section", text: { type: "mrkdwn", text: `*▶️ Continuing investigation*\n${issueKey} was queued to resume from the saved Codex context.` } }] }; }
   dismissed(issueKey: string): SlackMessage { return { text: `${issueKey} dismissed`, blocks: [{ type: "section", text: { type: "mrkdwn", text: `*🛑 Investigation dismissed*\n${issueKey} will not continue automatically. Existing isolated worktrees were retained.` } }] }; }

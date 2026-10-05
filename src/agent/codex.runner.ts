@@ -1,5 +1,4 @@
-import { spawn } from "node:child_process";
-import readline from "node:readline";
+import { Codex, type ThreadEvent } from "@openai/codex-sdk";
 
 export interface CodexRunOptions {
   workspacePath: string;
@@ -12,160 +11,90 @@ export interface CodexRunOptions {
   additionalWritableRoots?: string[];
   threadId?: string;
   onThreadStarted?: (threadId: string) => void | Promise<void>;
-  onEvent?: (event: CodexStreamEvent) => void;
+  onEvent?: (event: ThreadEvent) => void | Promise<void>;
 }
-
-export type CodexTaskStatus = "in_progress" | "complete" | "error";
-export type CodexStreamEvent =
-  | { type: "message"; text: string }
-  | { type: "task"; id: string; title: string; status: CodexTaskStatus; details?: string }
-  | { type: "plan"; title: string; steps: Array<{ id: string; title: string; status: CodexTaskStatus }> }
-  | { type: "file_change"; id: string; title: string; status: CodexTaskStatus; details?: string };
 
 export interface CodexRunResult {
   exitCode: number;
   output: string;
   codexThreadId?: string;
   error?: string;
+  timedOut?: boolean;
 }
 
-type RpcMessage = { id?: number; method?: string; params?: Record<string, unknown>; result?: Record<string, unknown>; error?: { message?: string } };
-
-/** A stdio JSON-RPC adapter for `codex app-server`. */
+/**
+ * Official Codex SDK adapter. The SDK owns the CLI process and JSONL protocol;
+ * Traceforge owns durable thread IDs, timeout/cancellation, and safe event delivery.
+ */
 export class CodexRunner {
-  constructor(private readonly command: string) {}
+  /** Omit the override to use the CLI version bundled with @openai/codex-sdk. */
+  constructor(private readonly command?: string) {}
 
-  run(options: CodexRunOptions): Promise<CodexRunResult> {
-    return new Promise((resolve, reject) => {
-      const child = spawn(this.command, ["app-server"], { cwd: options.workspacePath, shell: false, stdio: ["pipe", "pipe", "pipe"] });
-      const sandbox = options.mode === "workspace-write" ? "workspace-write" : "read-only";
-      const sandboxPolicy = options.mode === "workspace-write"
-        ? { type: "workspaceWrite", writableRoots: [options.workspacePath, ...(options.additionalWritableRoots ?? [])], networkAccess: options.allowNetwork ?? false }
-        : { type: "readOnly", networkAccess: false };
-      const pending = new Map<number, { resolve: (value: Record<string, unknown>) => void; reject: (error: Error) => void }>();
-      const agentMessageIds = new Set<string>();
-      let output = "";
-      let stderr = "";
-      let settled = false;
-      let timedOut = false;
-      let requestId = 0;
+  async run(options: CodexRunOptions): Promise<CodexRunResult> {
+    const controller = new AbortController();
+    let timedOut = false;
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      controller.abort(new Error(`Codex timed out after ${options.timeoutMs}ms`));
+    }, options.timeoutMs);
+    const abortFromCaller = (): void => controller.abort(options.signal?.reason);
+    if (options.signal?.aborted) abortFromCaller();
+    else options.signal?.addEventListener("abort", abortFromCaller, { once: true });
+
+    try {
+      const codex = this.command ? new Codex({ codexPathOverride: this.command }) : new Codex();
+      const threadOptions = {
+        workingDirectory: options.workspacePath,
+        sandboxMode: options.mode === "workspace-write" ? "workspace-write" as const : "read-only" as const,
+        approvalPolicy: "never" as const,
+        networkAccessEnabled: options.allowNetwork ?? false,
+        additionalDirectories: options.mode === "workspace-write" ? options.additionalWritableRoots : undefined,
+        threadSource: "traceforge",
+      };
+      const thread = options.threadId ? codex.resumeThread(options.threadId, threadOptions) : codex.startThread(threadOptions);
       let threadId = options.threadId;
-      let turnId: string | undefined;
-      let interruptTimer: NodeJS.Timeout | undefined;
-
-      const settle = (result: CodexRunResult): void => { if (!settled) { settled = true; clearTimeout(timer); if (interruptTimer) clearTimeout(interruptTimer); options.signal?.removeEventListener("abort", interrupt); resolve(result); } };
-      const fail = (error: Error): void => { if (!settled) { settled = true; clearTimeout(timer); if (interruptTimer) clearTimeout(interruptTimer); options.signal?.removeEventListener("abort", interrupt); reject(error); } };
-      const send = (message: unknown): void => { child.stdin.write(`${JSON.stringify(message)}\n`); };
-      const request = (method: string, params: Record<string, unknown>): Promise<Record<string, unknown>> => {
-        const id = ++requestId;
-        return new Promise((resolveRequest, rejectRequest) => { pending.set(id, { resolve: resolveRequest, reject: rejectRequest }); send({ method, id, params }); });
-      };
-      const timer = setTimeout(() => { timedOut = true; child.kill("SIGTERM"); }, options.timeoutMs);
-      const interrupt = (): void => {
-        if (settled) return;
-        if (!threadId || !turnId) { child.kill("SIGTERM"); return; }
-        void request("turn/interrupt", { threadId, turnId }).catch(() => child.kill("SIGTERM"));
-        interruptTimer = setTimeout(() => child.kill("SIGTERM"), 5_000);
-      };
-      if (options.signal?.aborted) interrupt();
-      else options.signal?.addEventListener("abort", interrupt, { once: true });
-
-      const onNotification = (message: RpcMessage): void => {
-        const params = message.params ?? {};
-        if (message.method === "item/agentMessage/delta" && typeof params.delta === "string") {
-          output += params.delta;
-          if (typeof params.itemId === "string") agentMessageIds.add(params.itemId);
-          options.onEvent?.({ type: "message", text: params.delta });
-          return;
-        }
-        if (message.method === "turn/plan/updated" && Array.isArray(params.plan)) {
-          const steps = params.plan.flatMap((step, index) => !isRecord(step) || typeof step.step !== "string" ? [] : [{ id: `plan-${index}`, title: step.step, status: planStatus(step.status) }]);
-          options.onEvent?.({ type: "plan", title: typeof params.explanation === "string" ? params.explanation : "Investigation plan", steps });
-          return;
-        }
-        if ((message.method === "item/started" || message.method === "item/completed") && isRecord(params.item)) {
-          const item = params.item;
-          const itemId = typeof item.id === "string" ? item.id : crypto.randomUUID();
-          const completed = message.method === "item/completed";
-          const status: CodexTaskStatus = completed && item.status === "failed" ? "error" : completed ? "complete" : "in_progress";
-          if (item.type === "agentMessage" && completed && typeof item.text === "string" && !agentMessageIds.has(itemId)) output += item.text;
-          if (item.type === "commandExecution") options.onEvent?.({ type: "task", id: `command-${itemId}`, title: commandTitle(typeof item.command === "string" ? item.command : ""), status, details: completed ? commandOutcome(item) : undefined });
-          if (item.type === "fileChange") {
-            const count = Array.isArray(item.changes) ? item.changes.length : 0;
-            options.onEvent?.({ type: "file_change", id: `file-${itemId}`, title: count ? `Updating ${count} workspace file${count === 1 ? "" : "s"}` : "Updating isolated workspace", status });
+      let failure: string | undefined;
+      const completedMessages = new Map<string, string>();
+      const latestMessages = new Map<string, string>();
+      const { events } = await thread.runStreamed(options.prompt, { outputSchema: options.outputSchema, signal: controller.signal });
+      const consumeEvents = async (): Promise<void> => {
+        for await (const event of events) {
+          if (event.type === "thread.started") {
+            threadId = event.thread_id;
+            await options.onThreadStarted?.(threadId);
           }
-          return;
-        }
-        if (message.method === "turn/completed") {
-          const turn = isRecord(params.turn) ? params.turn : {};
-          if (turnId && typeof turn.id === "string" && turn.id !== turnId) return;
-          const status = typeof turn.status === "string" ? turn.status : "failed";
-          const error = isRecord(turn.error) && typeof turn.error.message === "string" ? turn.error.message : undefined;
-          settle({ exitCode: status === "completed" ? 0 : 1, output: output.trim(), codexThreadId: threadId, error: error ?? (status === "completed" ? undefined : `Codex turn ${status}`) });
-          child.kill("SIGTERM");
+          if (event.type === "item.updated" && event.item.type === "agent_message") latestMessages.set(event.item.id, event.item.text);
+          if (event.type === "item.completed" && event.item.type === "agent_message") completedMessages.set(event.item.id, event.item.text);
+          if (event.type === "turn.failed") failure = event.error.message;
+          if (event.type === "error") failure = event.message;
+          await options.onEvent?.(event);
         }
       };
+      const consumed = consumeEvents().then(() => ({ type: "completed" as const }), (error: unknown) => ({ type: "failed" as const, error }));
+      const aborted = controller.signal.aborted
+        ? Promise.resolve({ type: "aborted" as const })
+        : new Promise<{ type: "aborted" }>((resolve) => controller.signal.addEventListener("abort", () => resolve({ type: "aborted" }), { once: true }));
+      const outcome = await Promise.race([consumed, aborted]);
+      if (outcome.type === "aborted") {
+        const message = controller.signal.reason instanceof Error ? controller.signal.reason.message : "Codex turn interrupted";
+        return { exitCode: 1, output: "", codexThreadId: threadId, error: message, timedOut };
+      }
+      if (outcome.type === "failed") throw outcome.error;
 
-      const lines = readline.createInterface({ input: child.stdout });
-      lines.on("line", (line) => {
-        let message: RpcMessage;
-        try { message = JSON.parse(line) as RpcMessage; } catch { return; }
-        if (typeof message.id === "number" && (message.result || message.error)) {
-          const waiting = pending.get(message.id);
-          if (!waiting) return;
-          pending.delete(message.id);
-          if (message.error) waiting.reject(new Error(message.error.message ?? "Codex App Server request failed"));
-          else waiting.resolve(message.result ?? {});
-          return;
-        }
-        if (typeof message.id === "number" && message.method) {
-          // A Slack approval is required before a workspace-write turn starts.
-          send({ id: message.id, error: { code: -32000, message: "Traceforge does not support in-turn interactive requests" } });
-          return;
-        }
-        if (message.method) onNotification(message);
-      });
-      child.stderr.on("data", (data: Buffer) => { stderr += data.toString(); });
-      child.on("error", fail);
-      child.on("close", (code) => {
-        if (settled) return;
-        if (timedOut) return settle({ exitCode: code ?? 1, output: output.trim(), codexThreadId: threadId, error: `Codex timed out after ${options.timeoutMs}ms${stderr ? `: ${stderr.trim()}` : ""}` });
-        settle({ exitCode: code ?? 1, output: output.trim(), codexThreadId: threadId, error: stderr.trim() || "Codex App Server stopped before completing the turn" });
-      });
-
-      void (async () => {
-        try {
-          await request("initialize", { clientInfo: { name: "traceforge", title: "Traceforge", version: "0.1.0" } });
-          send({ method: "initialized", params: {} });
-          const thread = threadId
-            ? await request("thread/resume", { threadId, cwd: options.workspacePath, sandbox, approvalPolicy: "never" })
-            : await request("thread/start", { cwd: options.workspacePath, sandbox, approvalPolicy: "never", serviceName: "traceforge" });
-          const threadRecord = isRecord(thread.thread) ? thread.thread : undefined;
-          if (!threadRecord || typeof threadRecord.id !== "string") throw new Error("Codex App Server did not return a thread ID");
-          threadId = threadRecord.id;
-          await options.onThreadStarted?.(threadId);
-          const turn = await request("turn/start", { threadId, input: [{ type: "text", text: options.prompt }], cwd: options.workspacePath, sandboxPolicy, approvalPolicy: "never", outputSchema: options.outputSchema });
-          const turnRecord = isRecord(turn.turn) ? turn.turn : undefined;
-          turnId = typeof turnRecord?.id === "string" ? turnRecord.id : undefined;
-        } catch (error) {
-          child.kill("SIGTERM");
-          fail(error instanceof Error ? error : new Error(String(error)));
-        }
-      })();
-    });
+      threadId ??= thread.id ?? undefined;
+      const output = [...(completedMessages.size ? completedMessages : latestMessages).values()].join("\n").trim();
+      if (failure) return { exitCode: 1, output, codexThreadId: threadId, error: failure };
+      return { exitCode: 0, output, codexThreadId: threadId };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (controller.signal.aborted) {
+        const timeoutMessage = controller.signal.reason instanceof Error ? controller.signal.reason.message : undefined;
+        return { exitCode: 1, output: "", codexThreadId: options.threadId, error: timeoutMessage ?? message ?? "Codex turn interrupted", timedOut };
+      }
+      throw error;
+    } finally {
+      clearTimeout(timeout);
+      options.signal?.removeEventListener("abort", abortFromCaller);
+    }
   }
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> { return typeof value === "object" && value !== null; }
-function planStatus(value: unknown): CodexTaskStatus { return value === "completed" ? "complete" : "in_progress"; }
-function commandTitle(command: string): string {
-  if (/git\s.*\blog\b/i.test(command)) return "Reviewing recent Git history";
-  if (/\brg\b|\bgrep\b|\bfind\b/i.test(command)) return "Searching relevant source code";
-  if (/\b(test|jest|vitest|gradle|xcodebuild)\b/i.test(command)) return "Checking relevant tests";
-  if (/\bgit\s+(diff|status)\b/i.test(command)) return "Reviewing workspace changes";
-  return "Inspecting relevant implementation";
-}
-function commandOutcome(item: Record<string, unknown>): string | undefined {
-  if (item.status === "failed") return "Command did not complete";
-  return typeof item.durationMs === "number" ? `Completed in ${(item.durationMs / 1_000).toFixed(1)}s` : undefined;
 }

@@ -4,35 +4,47 @@ import type { WorkspaceSnapshot } from "../../workspace/workspace.manager.js";
 
 const json = (value: unknown): Prisma.InputJsonValue => value as Prisma.InputJsonValue;
 
-export interface InvestigationContextRecord {
-  investigation: Awaited<ReturnType<InvestigationRepository["getInvestigation"]>>;
-  jira: NormalizedJiraIssue;
-}
-
 export class InvestigationRepository {
   constructor(private readonly db: PrismaClient) {}
 
-  async ingestJiraEvent(eventId: string, eventType: string, issue: NormalizedJiraIssue, comment?: string): Promise<string | null> {
+  /** Returns the investigation that owns a Slack thread, without consuming the event. */
+  async findInvestigationIdForSlackThread(channelId: string, threadTs: string): Promise<string | null> {
+    const thread = await this.db.slackThread.findUnique({ where: { channelId_threadTs: { channelId, threadTs } }, select: { investigationId: true } });
+    return thread?.investigationId ?? null;
+  }
+
+  /** Starts an investigation from a Slack Socket Mode command after Jira has been fetched. */
+  async startSlackInvestigation(input: { eventId: string; channelId: string; threadTs: string; issue: NormalizedJiraIssue; question: string; requester: { userId: string; teamId: string } }): Promise<string | null> {
     try {
       return await this.db.$transaction(async (tx) => {
-        await tx.externalEvent.create({ data: { source: "jira", providerEventId: eventId } });
+        await tx.externalEvent.create({ data: { source: "slack-socket", providerEventId: input.eventId } });
         const jira = await tx.jiraIssue.upsert({
-          where: { jiraIssueId: issue.id },
-          create: { jiraIssueId: issue.id, issueKey: issue.key, snapshot: json(issue) },
-          update: { issueKey: issue.key, snapshot: json(issue), fetchedAt: new Date() },
+          where: { jiraIssueId: input.issue.id },
+          create: { jiraIssueId: input.issue.id, issueKey: input.issue.key, snapshot: json(input.issue) },
+          update: { issueKey: input.issue.key, snapshot: json(input.issue), fetchedAt: new Date() },
         });
         const investigation = await tx.investigation.upsert({
           where: { jiraIssueRecordId: jira.id },
-          create: { jiraIssueRecordId: jira.id },
-          update: {},
+          create: { jiraIssueRecordId: jira.id, currentQuestion: input.question },
+          update: { currentQuestion: input.question, status: InvestigationStatus.CREATED },
+        });
+        await tx.slackThread.upsert({
+          where: { investigationId: investigation.id },
+          create: { investigationId: investigation.id, channelId: input.channelId, threadTs: input.threadTs },
+          update: { channelId: input.channelId, threadTs: input.threadTs },
         });
         await tx.investigationEvent.create({ data: {
           investigationId: investigation.id,
-          type: eventType === "jira:issue_created" ? InvestigationEventType.JIRA_CREATED : InvestigationEventType.JIRA_UPDATED,
-          source: "jira", content: `${issue.key}: ${issue.summary}`, metadata: json({ eventId, eventType }),
+          type: InvestigationEventType.SLACK_MESSAGE,
+          source: "slack-socket",
+          content: input.question,
+          metadata: json({ eventId: input.eventId, channelId: input.channelId, threadTs: input.threadTs, issueKey: input.issue.key }),
         } });
         await tx.investigationJob.create({ data: {
-          investigationId: investigation.id, type: comment ? "JIRA_COMMENT" : "JIRA_SYNC", payload: json(comment ? { issueKey: issue.key, question: comment } : { issueKey: issue.key }), dedupeKey: `jira:${eventId}`,
+          investigationId: investigation.id,
+          type: "SLACK_TRIGGER",
+          payload: json({ question: input.question, requester: input.requester }),
+          dedupeKey: `slack-socket:${input.eventId}`,
         } });
         return investigation.id;
       });
@@ -42,15 +54,16 @@ export class InvestigationRepository {
     }
   }
 
-  async enqueueSlackQuestion(eventId: string, channelId: string, threadTs: string, question: string, requester: { userId: string; teamId: string }): Promise<string | null> {
+  /** Queues a Socket Mode app mention made in a stored investigation thread. */
+  async enqueueSocketQuestion(input: { eventId: string; channelId: string; threadTs: string; question: string; requester: { userId: string; teamId: string } }): Promise<string | null> {
     try {
       return await this.db.$transaction(async (tx) => {
-        await tx.externalEvent.create({ data: { source: "slack", providerEventId: eventId } });
-        const thread = await tx.slackThread.findUnique({ where: { channelId_threadTs: { channelId, threadTs } } });
+        await tx.externalEvent.create({ data: { source: "slack-socket", providerEventId: input.eventId } });
+        const thread = await tx.slackThread.findUnique({ where: { channelId_threadTs: { channelId: input.channelId, threadTs: input.threadTs } } });
         if (!thread) return null;
-        await tx.investigation.update({ where: { id: thread.investigationId }, data: { currentQuestion: question } });
-        await tx.investigationEvent.create({ data: { investigationId: thread.investigationId, type: InvestigationEventType.USER_QUESTION, source: "slack", content: question, metadata: json({ eventId, channelId, threadTs }) } });
-        await tx.investigationJob.create({ data: { investigationId: thread.investigationId, type: "SLACK_QUESTION", payload: json({ question, requester }), dedupeKey: `slack:${eventId}` } });
+        await tx.investigation.update({ where: { id: thread.investigationId }, data: { currentQuestion: input.question } });
+        await tx.investigationEvent.create({ data: { investigationId: thread.investigationId, type: InvestigationEventType.USER_QUESTION, source: "slack-socket", content: input.question, metadata: json({ eventId: input.eventId, channelId: input.channelId, threadTs: input.threadTs }) } });
+        await tx.investigationJob.create({ data: { investigationId: thread.investigationId, type: "SLACK_QUESTION", payload: json({ question: input.question, requester: input.requester }), dedupeKey: `slack-socket:${input.eventId}` } });
         return thread.investigationId;
       });
     } catch (error) {
@@ -152,10 +165,6 @@ export class InvestigationRepository {
       create: { investigationId, repositoryName: snapshot.repositoryName, platform: snapshot.platform, sourcePath: snapshot.sourcePath, workspacePath: snapshot.workspacePath, branch: snapshot.branch, commitSha: snapshot.commitSha, sourceUrlTemplate: snapshot.sourceUrlTemplate },
       update: { platform: snapshot.platform, sourcePath: snapshot.sourcePath, workspacePath: snapshot.workspacePath, branch: snapshot.branch, commitSha: snapshot.commitSha, sourceUrlTemplate: snapshot.sourceUrlTemplate, lastUpdatedAt: new Date() },
     })));
-  }
-
-  async ensureSlackThread(investigationId: string, channelId: string, threadTs: string): Promise<void> {
-    await this.db.slackThread.upsert({ where: { investigationId }, create: { investigationId, channelId, threadTs }, update: { channelId, threadTs } });
   }
 
   async completeJob(id: string): Promise<void> {

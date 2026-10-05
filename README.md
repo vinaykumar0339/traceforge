@@ -1,11 +1,11 @@
 # Traceforge
 
-Traceforge is a single-process Express service that turns Jira issue events into evidence-based Codex investigations and continues those investigations in Slack threads. PostgreSQL persists the ticket, thread mapping, history, idempotency receipts, repository snapshots, and durable jobs; Redis is intentionally not required.
+Traceforge is a single-process Express service that turns Slack Socket Mode commands into evidence-based Jira/Codex investigations and continues them in Slack threads. PostgreSQL persists the ticket, thread mapping, history, idempotency receipts, repository snapshots, and durable jobs; Redis is intentionally not required.
 
 ## Local setup
 
 1. Install Node 22 and pnpm 11.
-2. Copy `.env.example` to `.env`, generate strong values for `API_AUTH_TOKEN` and `JIRA_WEBHOOK_SECRET`, and enter Jira/Slack credentials.
+2. Copy `.env.example` to `.env`, generate a strong `API_AUTH_TOKEN`, and enter Jira plus Slack bot/app credentials. Never commit tokens.
 3. Copy `repositories.example.yaml` to `repositories.yaml` and configure existing local Git repositories. These paths must be Git working trees; Traceforge does not clone them.
 4. Start PostgreSQL: `pnpm db:up`.
 5. Generate/apply the schema: `pnpm prisma:generate && pnpm prisma:migrate`.
@@ -32,9 +32,9 @@ sourceUrlTemplate: https://bitbucket.org/your-workspace/android/src/{ref}/{path}
 
 Traceforge replaces `{ref}` with the captured commit SHA, `{path}` with the repository-relative path, `{file}` with its final file name, and `{line}` with the source line. The link stays pinned to the source revision that Codex investigated. Keep this unset when the repository has no browser-accessible URL.
 
-Install and authenticate a current Codex CLI on the host running Traceforge, then leave `CODEX_COMMAND=codex` or point it to its absolute executable path. The runner starts `codex app-server` as a private stdio process (never a network listener), then uses JSON-RPC to start or resume a Codex thread for the investigation. The stored thread ID means a Slack follow-up continues the same Codex conversation.
+Traceforge uses the official `@openai/codex-sdk`, which manages the Codex CLI process and streams typed thread events. Authenticate Codex on the host as usual. The SDK uses its bundled CLI by default; set `CODEX_COMMAND` only when the host requires a managed CLI executable. Traceforge stores the SDK thread ID, so a Slack follow-up resumes the same Codex conversation.
 
-App Server emits message deltas, plan updates, command lifecycle events, and file-change events. Traceforge turns them into native Slack streaming chunks and task cards when supported, or throttled rich Block Kit updates otherwise. It never sends raw command output or internal reasoning to Slack.
+The Codex SDK emits typed lifecycle, tool, plan, file-change, and message events. Traceforge maps those into native Slack `ChatStreamer` chunks and task cards when supported, or throttled rich Block Kit updates otherwise. It never sends raw command output or internal reasoning to Slack.
 
 The prompt is built dynamically. Its effective context has this shape:
 
@@ -50,42 +50,31 @@ The prompt is built dynamically. Its effective context has this shape:
 
 ## Configure Jira
 
-Create an HTTPS Jira Cloud webhook for `jira:issue_created` and `jira:issue_updated` pointing to:
-
-```text
-https://your-public-host/webhooks/jira
-```
-
-Set a secret on the Jira webhook and place the same value in `JIRA_WEBHOOK_SECRET`. Traceforge validates the raw request `X-Hub-Signature` HMAC and uses `X-Atlassian-Webhook-Identifier` to deduplicate retries. The service fetches the complete issue from Jira REST API before Codex runs.
-
-For local development, expose port 3000 with an HTTPS tunnel such as Cloudflare Tunnel or ngrok. Do not expose the operator API publicly without a reverse proxy in addition to its bearer token.
-
-Example Jira payload:
-
-```json
-{
-  "webhookEvent": "jira:issue_created",
-  "issue": { "id": "10001", "key": "TF-7", "fields": { "summary": "Save fails", "labels": ["backend"] } }
-}
-```
+No Jira webhook is required. Traceforge fetches the full Jira ticket through REST only after an authorized Slack Socket Mode command supplies its key. Keep `JIRA_BASE_URL`, `JIRA_EMAIL`, and `JIRA_API_TOKEN` configured.
 
 ## Configure Slack
 
-Create a Slack app, install it in the target workspace, set `SLACK_BOT_TOKEN`, `SLACK_SIGNING_SECRET`, and `SLACK_CHANNEL_ID`, and subscribe its Events API Request URL to:
+Create a Slack app, install it in the target workspace, enable **Socket Mode**, and configure `SLACK_BOT_TOKEN` and a rotated `SLACK_APP_TOKEN` with the `connections:write` scope. No Slack Request URL, signing secret, or public HTTPS tunnel is required for events or interactive controls.
+
+Subscribe to the `app_mention` bot event and enable **Interactivity & Shortcuts**; Socket Mode delivers both over the WebSocket. Grant `chat:write`, `app_mentions:read`, and the required private-channel history scope, then invite the bot to the channel.
+
+Set the dedicated Slack investigation destination channel ID. Traceforge accepts ticket mentions in any channel where the bot has been invited:
 
 ```text
-https://your-public-host/webhooks/slack
+SLACK_INVESTIGATION_CHANNEL_ID=<traceforce-app channel ID>
 ```
 
-This deployment targets a private channel. Subscribe to `message.groups`, grant `chat:write` and `groups:history`, then invite the bot to the configured private channel. Slack URL verification is answered synchronously after signature validation. Human messages that are replies in a stored investigation thread enqueue a follow-up; bot messages and unrelated threads are ignored.
-
-Traceforge filters Codex JSONL internally: Slack never receives raw agent protocol events, shell commands, or stderr. It uses Slack native streaming for eligible human thread replies and falls back to one throttled, rich Block Kit progress message when streaming is unavailable (including Jira-triggered investigations without a Slack recipient). Completed reports use structured Block Kit messages; full output is appended to `workspaces/<issue-key>/investigation.md`.
-
-Enable **Interactivity & Shortcuts** in the Slack app and set its Request URL to:
+Start a ticket investigation with a key or a Jira link; the `investigate` keyword is optional:
 
 ```text
-https://your-public-host/webhooks/slack/interactions
+@Traceforge investigate TF-123
+@Traceforge investigate https://your-domain.atlassian.net/browse/TF-123
+@Traceforge please check https://your-domain.atlassian.net/browse/TF-123
 ```
+
+The app acknowledges the Socket Mode envelope immediately, fetches the Jira ticket, creates a new investigation thread in `SLACK_INVESTIGATION_CHANNEL_ID`, and acknowledges it in the originating thread. Reusing a ticket starts/resumes its durable Codex thread in the new investigation thread. To ask a follow-up, mention Traceforge in that investigation thread, for example `@Traceforge check iOS too`. Mentions without a Jira ticket outside an investigation thread receive a brief reminder that Traceforge only handles Jira investigations.
+
+Traceforge filters Codex SDK events internally: Slack never receives internal reasoning, raw commands, or stderr. It uses Slack native streaming for eligible command threads and falls back to one throttled, rich Block Kit progress message when streaming is unavailable. Completed reports use structured Block Kit messages; full output is appended to `workspaces/<issue-key>/investigation.md`.
 
 Configure approved Slack user IDs before enabling write-capable work:
 
@@ -97,7 +86,7 @@ SLACK_APPROVAL_TIMEOUT_MINUTES=60
 
 Before a Slack follow-up can change code, Traceforge asks Codex through a constrained, read-only intent gate to classify the request semantically as read-only, patch, commit, push, or uncertain. It does not use keyword matching. Patch, commit, and push requests receive a durable approval card that states the exact scope; uncertain requests fail closed as read-only. Only configured approvers can use these signed actions. A change-and-push approval additionally allows a normal (never force) push of that ticket branch to `origin`; it never alters the configured source checkout or another branch.
 
-Every active Codex run also has a signed Slack control card for configured approvers. **Stop** interrupts the active App Server turn and leaves the investigation paused. **Continue** queues the same investigation against its stored Codex thread; a previously approved write/push request is classified again and requires fresh approval. **Dismiss** cancels pending work but retains the isolated worktree and any already-created local changes.
+Every active Codex run also has a signed Slack control card for configured approvers. **Stop** aborts the active SDK turn and leaves the investigation paused. **Continue** queues the same investigation against its stored Codex thread; a previously approved write/push request is classified again and requires fresh approval. **Dismiss** cancels pending work but retains the isolated worktree and any already-created local changes.
 
 Example conversation:
 
@@ -107,16 +96,6 @@ Engineer:   Is this also happening in iOS?
 Traceforge: 🔍 Investigating your question…
 Traceforge: ✅ Investigation complete
             Android reaches the failing save path in …; iOS guards the equivalent state in …
-```
-
-Example Slack event:
-
-```json
-{
-  "type": "event_callback",
-  "event_id": "Ev123",
-  "event": { "type": "message", "channel": "C123", "thread_ts": "1710000000.000100", "text": "Is this also happening in iOS?" }
-}
 ```
 
 ## Operations and API

@@ -1,35 +1,79 @@
-import { createHmac, timingSafeEqual } from "node:crypto";
 import { z } from "zod";
 
-const envelopeSchema = z.object({
-  type: z.string(),
-  challenge: z.string().optional(),
-  event_id: z.string().optional(),
-  team_id: z.string().optional(),
+const socketEventSchema = z.object({
+  type: z.literal("event_callback"),
+  event_id: z.string().min(1),
+  team_id: z.string().min(1),
   event: z.object({
-    type: z.string(), channel: z.string().optional(), thread_ts: z.string().optional(), ts: z.string().optional(),
-    text: z.string().optional(), user: z.string().optional(), bot_id: z.string().optional(), subtype: z.string().optional(),
-  }).optional(),
-}).passthrough();
+    type: z.literal("app_mention"),
+    channel: z.string().min(1),
+    ts: z.string().min(1),
+    thread_ts: z.string().optional(),
+    text: z.string().min(1),
+    user: z.string().min(1),
+    bot_id: z.string().optional(),
+  }),
+});
 
-export interface SlackThreadMessage { eventId: string; channelId: string; threadTs: string; text: string; userId: string; teamId: string }
+export interface SlackSocketMention {
+  eventId: string;
+  channelId: string;
+  threadTs: string;
+  text: string;
+  userId: string;
+  teamId: string;
+}
+
+export interface SlackInvestigationTrigger extends SlackSocketMention {
+  issueKey: string;
+  question: string;
+}
+
 export type SlackInteraction =
   | { kind: "approval"; approvalId: string; decision: "approve" | "reject"; userId: string; teamId: string; channelId: string; messageTs: string; interactionId: string }
   | { kind: "control"; action: "stop" | "continue" | "dismiss"; investigationId: string; userId: string; teamId: string; channelId: string; messageTs: string; interactionId: string };
 
-export function verifySlackSignature(rawBody: Buffer, timestamp: string | undefined, signature: string | undefined, secret: string, now = Date.now()): boolean {
-  if (!timestamp || !signature || !/^v0=[a-f0-9]{64}$/i.test(signature) || !/^\d+$/.test(timestamp)) return false;
-  if (Math.abs(now / 1_000 - Number(timestamp)) > 60 * 5) return false;
-  const expected = `v0=${createHmac("sha256", secret).update(`v0:${timestamp}:${rawBody.toString("utf8")}`).digest("hex")}`;
-  return timingSafeEqual(Buffer.from(expected), Buffer.from(signature));
+/** Parses an app mention that names a Jira issue. `investigate` is optional for natural-language requests. */
+export function parseSlackSocketTrigger(body: unknown): SlackInvestigationTrigger | null {
+  const mention = parseSlackSocketMention(body);
+  if (!mention) return null;
+  const command = mention.text.replace(/<@[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+  const issueKey = extractJiraIssueKey(command);
+  if (!issueKey) return null;
+  const remainder = command
+    .replace(/<https?:\/\/[^>|]+(?:\|[^>]+)?>/g, "")
+    .replace(/https?:\/\/\S+/g, "")
+    .replace(/^investigate\b/i, "")
+    .replace(new RegExp(`\\b${escapeRegex(issueKey)}\\b`, "i"), "")
+    .replace(/\s+/g, " ")
+    .trim();
+  return {
+    ...mention,
+    issueKey,
+    question: remainder ? `Investigate ${issueKey}. Additional request: ${remainder}` : `Investigate Jira issue ${issueKey}.`,
+  };
 }
 
-export function parseSlackEnvelope(body: unknown): { challenge?: string; message?: SlackThreadMessage } {
-  const parsed = envelopeSchema.parse(body);
-  if (parsed.type === "url_verification") return { challenge: parsed.challenge };
-  const event = parsed.event;
-  if (parsed.type !== "event_callback" || !parsed.event_id || !parsed.team_id || !event || event.type !== "message" || event.subtype || event.bot_id || !event.channel || !event.thread_ts || !event.text || !event.user) return {};
-  return { message: { eventId: parsed.event_id, channelId: event.channel, threadTs: event.thread_ts, text: event.text, userId: event.user, teamId: parsed.team_id } };
+/** Parses all human app mentions, including questions in an existing investigation thread. */
+export function parseSlackSocketMention(body: unknown): SlackSocketMention | null {
+  const parsed = socketEventSchema.safeParse(body);
+  if (!parsed.success || parsed.data.event.bot_id) return null;
+  return {
+    eventId: parsed.data.event_id,
+    channelId: parsed.data.event.channel,
+    threadTs: parsed.data.event.thread_ts ?? parsed.data.event.ts,
+    text: parsed.data.event.text,
+    userId: parsed.data.event.user,
+    teamId: parsed.data.team_id,
+  };
+}
+
+/** Supports `TF-123`, Jira /browse/TF-123 URLs, modern project issue URLs, and Slack-formatted links. */
+export function extractJiraIssueKey(value: string): string | null {
+  const match = value.match(/\b([A-Z][A-Z0-9]+-\d+)\b/i);
+  if (match?.[1]) return match[1].toUpperCase();
+  const projectIssue = value.match(/\/projects\/([A-Z][A-Z0-9]+)\/issues\/(\d+)/i);
+  return projectIssue ? `${projectIssue[1]!.toUpperCase()}-${projectIssue[2]!}` : null;
 }
 
 const interactionSchema = z.object({
@@ -45,3 +89,5 @@ export function parseSlackInteraction(payload: unknown): SlackInteraction | null
   if (action.action_id === "approval_approve" || action.action_id === "approval_reject") return { kind: "approval", approvalId: action.value, decision: action.action_id === "approval_approve" ? "approve" : "reject", ...common };
   return { kind: "control", action: action.action_id.replace("investigation_", "") as "stop" | "continue" | "dismiss", investigationId: action.value, ...common };
 }
+
+function escapeRegex(value: string): string { return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }

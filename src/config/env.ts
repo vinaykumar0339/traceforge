@@ -10,11 +10,12 @@ const envSchema = z.object({
   JIRA_BASE_URL: z.string().url(),
   JIRA_EMAIL: z.string().email(),
   JIRA_API_TOKEN: z.string().min(1),
-  JIRA_WEBHOOK_SECRET: z.string().min(16),
   SLACK_BOT_TOKEN: z.string().min(1),
-  SLACK_SIGNING_SECRET: z.string().min(16),
-  SLACK_CHANNEL_ID: z.string().min(1),
-  CODEX_COMMAND: z.string().min(1).default("codex"),
+  SLACK_APP_TOKEN: z.string().regex(/^xapp-/),
+  // Channel ID, not a name. Each investigation gets a new root thread here.
+  SLACK_INVESTIGATION_CHANNEL_ID: z.string().min(1),
+  // Omit to use the Codex CLI bundled with @openai/codex-sdk. Set only for a managed CLI path.
+  CODEX_COMMAND: z.string().min(1).optional(),
   CODEX_TIMEOUT_MS: z.coerce.number().int().positive().default(900_000),
   WORKSPACE_ROOT: z.string().min(1).default("./workspaces"),
   REPOSITORIES_CONFIG_PATH: z.string().min(1).default("./repositories.yaml"),

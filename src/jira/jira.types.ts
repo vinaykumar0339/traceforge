@@ -23,9 +23,3 @@ export interface NormalizedJiraIssue {
   customFields: Record<string, unknown>;
   raw: unknown;
 }
-
-export interface JiraWebhookEvent {
-  webhookEvent: string;
-  issue: { id: string; key: string; fields?: Record<string, unknown> };
-  comment?: { id?: string; body?: unknown };
-}

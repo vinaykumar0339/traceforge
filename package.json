@@ -4,7 +4,9 @@
   "private": true,
   "type": "module",
   "packageManager": "pnpm@11.10.0",
-  "engines": { "node": ">=22" },
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
     "dev": "tsx watch src/server.ts",
     "build": "tsc -p tsconfig.json",
@@ -18,7 +20,9 @@
     "db:down": "docker compose down"
   },
   "dependencies": {
+    "@openai/codex-sdk": "^0.160.0",
     "@prisma/client": "^6.17.0",
+    "@slack/socket-mode": "^3.1.0",
     "@slack/web-api": "^7.9.2",
     "dotenv": "^16.6.1",
     "express": "^5.1.0",
